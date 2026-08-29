@@ -1,0 +1,410 @@
+<!doctype html>
+
+<html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+    </head>
+    <style>
+        body {
+            margin : 0;
+            height : 100%;
+            width : 100%;
+        }
+        canvas { 
+            display: block;
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 100%;
+            width: 100%;
+         }
+    </style>
+    <body>
+        <canvas id = 'canvas' width = '512' height = '512'></canvas>
+        <script type = 'module'>
+
+            // SECTION 1. Define global variables and constants.
+            var pos = [0,0];
+            var bits = [0,0];
+            var rowId = -1;
+            var colId = -1;
+            var origin = [0.02,0.02];
+            var dim = 0.65;
+            var aspectRatio = 1;
+            var touches = [];
+            var swipe = false;
+            var pinch = false;
+
+            const UNIFORM_BYTES = 4*4;
+            const UNIFORM_BUFFER = new Float32Array(UNIFORM_BYTES/4);
+            const AR_IDX = 0;
+            const DIM_IDX = 1;
+            const ORIGIN_IDX = 2;
+            const BIT_BUFFER = new Uint32Array(2);
+
+            // SECTION 2. Connect to the gpu and screen.
+            const adapter = await navigator.gpu?.requestAdapter();
+            const device = await adapter?.requestDevice();
+            if (!device) {
+                console.log('ERROR.');
+                alert('Enable WebGPU in your browser settings.')
+            }
+            const canvas  = document.getElementById('canvas');
+            const context = canvas.getContext('webgpu');
+            context.configure({     
+                device : device,
+                format : navigator.gpu.getPreferredCanvasFormat()
+            });
+
+            // SECTION 3. Make a little vertex buffer.
+            const VERTICES = new Float32Array([ 
+                -1, -1, 
+                 1, -1,
+                -1,  1,
+
+                -1,  1,
+                 1, -1,
+                 1,  1,
+            ]);
+            const vertexBufferLayout = {
+                arrayStride : 8,
+                attributes : [{
+                    format : 'float32x2',
+                    offset : 0,
+                    shaderLocation : 0
+                }]
+            };
+            const vertexBuffer = device.createBuffer({
+                label : 'vertex buffer',
+                size : VERTICES.byteLength,
+                usage : GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
+            });
+            device.queue.writeBuffer(vertexBuffer, 0, VERTICES);
+        
+            // SECTION 4. Make the uniform buffer and texture.
+            const uniformBuffer = device.createBuffer({
+                label : 'uniform buffer',
+                size : UNIFORM_BYTES,
+                usage : GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });   
+            const bitBuffer = device.createBuffer({
+                label : 'bit buffer',
+                size : 8,
+                usage : GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+            });
+
+            // SECTION 5. Make the bindgroups.
+            const bindGroupLayout = device.createBindGroupLayout({
+                entries : [{
+                    binding : 0,
+                    visibility : GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                    buffer : {type : 'uniform'}
+                },{
+                    binding : 1,
+                    visibility : GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+                    buffer : {type : 'uniform'}
+                }]
+            });
+
+            const bindGroup = device.createBindGroup({
+                layout : bindGroupLayout,
+                entries : [ 
+                    {binding : 0, resource : {buffer : uniformBuffer}},
+                    {binding : 1, resource : {buffer : bitBuffer}},
+                ]
+            });
+
+            const pipelineLayout = device.createPipelineLayout({
+                bindGroupLayouts : [bindGroupLayout]
+            });
+
+            // SECTION 6. Make the shaders.
+            const shader = device.createShaderModule({
+                label : 'shader',
+                code  : `
+                    struct Pixel {
+                        @builtin(position) clip  : vec4f,
+                        @location(0)       coord : vec2f // Coordinates live in the unit interval.
+                    };
+
+                    struct Screen {
+                        ar     : f32,
+                        dim    : f32,
+                        origin : vec2f,
+                    };
+
+                    @group(0) @binding(0) var<uniform> screen : Screen;
+                    @group(0) @binding(1) var<uniform> bits   : vec2u;
+
+                    const BLACK = vec3f(0);
+                    const WHITE = vec3f(1);
+                    
+                    fn margin(v : vec2f) -> bool {
+                        return any(v<vec2f(0)) || any(v>vec2f(1));
+                    }
+
+                    fn active_bit(v : vec2f) -> bool {
+                        let n = i32(v.y>=0.5);
+                        let i = floor(v.y*8);
+                        let j = floor(v.x*8);
+                        let idx = u32(8*i+j)%32;
+                        return bool(extractBits(bits[n],idx,1));
+                    }
+
+                    @vertex 
+                    fn vs(@location(0) clip : vec2f) -> Pixel {
+                        var pixel : Pixel;
+                        pixel.clip = vec4f(clip, 1, 1);
+                        pixel.coord = 0.5 * (clip + vec2f(1));
+                        pixel.coord.y = 1 - pixel.coord.y;
+                        return pixel;
+                    }
+                        
+                    @fragment 
+                    fn fs(pixel : Pixel) -> @location(0) vec4f {
+                        let screen_shape = vec2f(1,screen.ar);
+                        let grid_coord = (pixel.coord*screen_shape-screen.origin)/screen.dim;
+                        let is_margin = margin(grid_coord);
+                        let is_active_bit = active_bit(grid_coord);
+                        let color = select(WHITE, BLACK, is_active_bit || is_margin);
+                        return vec4f(vec3f(color),1);
+                    }
+                `
+            });
+
+            // SECTION 7: Make the pipelines.
+            const pipeline = device.createRenderPipeline({
+                label : 'pipeline',
+                layout : pipelineLayout,
+                vertex : {
+                    module : shader,
+                    entryPoint : 'vs',
+                    buffers : [ vertexBufferLayout ]
+                },
+                fragment : {
+                    module : shader,
+                    entryPoint : 'fs',
+                    targets : [{ 
+                        format : navigator.gpu.getPreferredCanvasFormat() 
+                    }]
+                }
+            });
+
+            // SECTION 8: Run the shaders.
+            function render() {
+                device.queue.writeBuffer(uniformBuffer, 0, UNIFORM_BUFFER);
+                device.queue.writeBuffer(bitBuffer, 0, BIT_BUFFER);
+            
+                const encoder = device.createCommandEncoder();
+            
+                const renderPass = encoder.beginRenderPass({
+                    colorAttachments : [{
+                        view : context.getCurrentTexture().createView(),
+                        loadOp : 'clear',
+                        storeOp : 'store'
+                    }] 
+                });
+                renderPass.setPipeline(pipeline);
+                renderPass.setBindGroup(0, bindGroup);
+                renderPass.setVertexBuffer(0, vertexBuffer);
+                renderPass.setViewport(0, 0, canvas.width, canvas.height, 0, 1),
+                renderPass.draw(VERTICES.length / 2);
+                renderPass.end();
+  
+                const commandBuffer = encoder.finish();
+                device.queue.submit([commandBuffer]);
+                window.requestAnimationFrame(render);
+            }
+
+
+            // SECTION 9. Time and input/output.
+            function readPath() {
+                const path = window.location.pathname.slice(1);
+                if (path.length > 0) {
+                    try {
+                        const num = BigInt(path);
+                        const bottomBits = num%BigInt(2**32);
+                        const topBits = (num-bottomBits)/BigInt(2**32);
+                        bits = [Number(bottomBits), Math.trunc(Number(topBits))];
+                    } catch (error) {
+                    }
+                } else {
+                    bits = [0,0];
+                }
+                BIT_BUFFER.set(bits,0);
+            }
+
+            function resize() {
+                const width = window.innerWidth * devicePixelRatio;
+                const height = window.innerHeight * devicePixelRatio;
+                const dimBig = Math.max(width,height);
+                const dimSmall = Math.min(width,height);
+                if (screen.orientation.type.startsWith('portrait')) {
+                    canvas.width = dimSmall;
+                    canvas.height = dimBig;
+                }
+                else {
+                    canvas.width = dimBig;
+                    canvas.height = dimSmall;
+                }
+                aspectRatio = canvas.height/canvas.width;
+                dim = Math.min(1,aspectRatio)*0.65;
+                origin = [0.02,0.02];
+                UNIFORM_BUFFER.set([aspectRatio], AR_IDX);
+                UNIFORM_BUFFER.set([dim],DIM_IDX);
+                UNIFORM_BUFFER.set(origin,ORIGIN_IDX);
+
+            }
+
+            function updatePos() {
+                const rect = canvas.getBoundingClientRect();
+                const x = (event.targetTouches[0].clientX - rect.left)/rect.width;
+                const y = (event.targetTouches[0].clientY - rect.top)/rect.height;
+                pos = [x,y];
+            }
+
+            function touchStart() {
+                event.preventDefault();
+                if (touches.length == 0) {
+                    updatePos();
+                }
+                touches = event.targetTouches;
+                if (touches.length == 1) {
+                    swipe = true;
+                } else {
+                    swipe = false;
+                    pinch = true;
+                }
+            }
+
+            function setBit(i,j) {
+                const idx = (8*i+j)%32;
+                const n = Number(i>=4);
+                bits[n] ^= (1 << idx);
+            }
+
+            function findBit() {
+                const x = pos[0];
+                const y = pos[1]*aspectRatio;
+                if (x<origin[0] || x>(origin[0]+dim) || y<origin[1] || (y>origin[1]+dim)) {
+                    return;
+                }
+                const j = Math.floor(8*(x-origin[0])/dim);
+                const i = Math.floor(8*(y-origin[1])/dim);
+                if ((rowId != j) || (colId != i)) {
+                    rowId = j;
+                    colId = i;
+                    setBit(colId,rowId);
+                    BIT_BUFFER.set(bits,0);
+                }
+            }   
+
+            function touchMove() {
+                if (swipe) {
+                    updatePos();
+                    findBit();
+                } else if (pinch) {
+                    const newTouches = event.targetTouches;
+                    const v0 = [touches[0].clientX-newTouches[0].clientX,touches[0].clientY-newTouches[0].clientY];
+                    const v1 = [touches[1].clientX-newTouches[1].clientX,touches[1].clientY-newTouches[1].clientY];
+                    const angle = (v0[0]*v1[0]+v0[1]*v1[1]);
+                    if (angle<0.5) {
+                        const d0 = Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
+                        const d1 = Math.hypot(newTouches[0].clientX - newTouches[1].clientX, newTouches[0].clientY - newTouches[1].clientY);
+                        const acc = 0.01*(d1-d0);
+                        const dim1 = dim+acc;
+                        if ((dim1 > 0.1) & (dim1 < 10)) {
+                            const rect = canvas.getBoundingClientRect();
+                            const x = 0.5*(touches[0].clientX + touches[1].clientX)/rect.width;
+                            const y = 0.5*(touches[0].clientY + touches[1].clientY)/rect.height*aspectRatio;
+                            origin = [(origin[0] - x)*dim1/dim+x, (origin[1] - y)*dim1/dim+y];
+                            dim = dim1;
+                            UNIFORM_BUFFER.set(origin,ORIGIN_IDX);
+                            UNIFORM_BUFFER.set([dim],DIM_IDX);
+                        }
+                    } else {
+                        const rect = canvas.getBoundingClientRect();
+                        const x = 0.5*(touches[0].clientX + touches[1].clientX)/rect.width;
+                        const y = 0.5*(touches[0].clientY + touches[1].clientY)/rect.height*aspectRatio;
+                        const newx = 0.5*(newTouches[0].clientX + newTouches[1].clientX)/rect.width;
+                        const newy = 0.5*(newTouches[0].clientY + newTouches[1].clientY)/rect.height*aspectRatio;
+                        origin = [origin[0] + newx-x, origin[1] + newy-y];
+                        UNIFORM_BUFFER.set(origin,ORIGIN_IDX);
+                    }
+                }
+                touches = event.targetTouches;
+            }
+
+            function touchEnd() {
+                if (swipe) {
+                    findBit();
+                } else if (pinch) {
+                }
+                swipe = false;
+                pinch = false;
+                rowId = -1;
+                colId = -1;
+                touches = [];
+                window.history.pushState({ goBack : true, page : 'new' }, '', '/'+packedString().replaceAll(',',''));
+            }
+            
+            function mouseDown() {
+                findBit();
+                swipe = true;
+            }
+
+            function mouseMove() { 
+                const rect = canvas.getBoundingClientRect();
+                const x = (event.clientX - rect.left)/rect.width;
+                const y = (event.clientY - rect.top)/rect.height;
+                pos = [x,y];
+                if (swipe) {
+                    findBit();
+                }
+            }
+
+            function mouseUp() {
+                swipe = false;
+                rowId = -1;
+                colId = -1;
+                window.history.pushState({ page: 'new' }, '', '/'+packedString().replaceAll(',',''));
+            }
+
+            function packedString() {
+                let topBits = BigInt(bits[0]);
+                if (topBits<0) {
+                    topBits += BigInt(2**32);
+                }
+                let bottomBits = BigInt(bits[1]);
+                if (bottomBits<0) {
+                    bottomBits += BigInt(2**32);
+                }
+                const str = String(topBits+BigInt(2**32)*bottomBits);
+                return str;
+            }
+
+            function packedArray() {
+                const str = packedString();
+                const arr = [...str].map(Number);
+                return arr;
+            }
+
+            // SECTION 10. Run the program.
+            readPath();
+            resize();  
+            canvas.addEventListener('mousedown', mouseDown); 
+            canvas.addEventListener('mousemove', mouseMove); 
+            canvas.addEventListener('mouseup', mouseUp); 
+            window.addEventListener('resize',resize);
+            window.addEventListener('popstate',readPath);
+            canvas.addEventListener('touchstart', touchStart);
+            canvas.addEventListener('touchmove', touchMove);
+            canvas.addEventListener('touchend', touchEnd);
+            screen.orientation.addEventListener('change',resize);
+            render();
+        
+        </script>
+    </body>
+</html>
