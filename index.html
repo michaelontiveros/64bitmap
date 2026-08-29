@@ -145,6 +145,10 @@
                         return any(v<vec2f(0)) || any(v>vec2f(1));
                     }
 
+                    fn frame(v : vec2f) -> bool {
+                        return any(abs(v)<vec2f(0.02)) || any(abs(v-vec2f(1))<vec2f(0.02));
+                    }
+
                     fn active_bit(v : vec2f) -> bool {
                         let n = i32(v.y>=0.5);
                         let i = floor(v.y*8);
@@ -167,8 +171,9 @@
                         let screen_shape = vec2f(1,screen.ar);
                         let grid_coord = (pixel.coord*screen_shape-screen.origin)/screen.dim;
                         let is_margin = margin(grid_coord);
+                        let is_frame = frame(grid_coord);
                         let is_active_bit = active_bit(grid_coord);
-                        let color = select(WHITE, BLACK, is_active_bit || is_margin);
+                        let color = select(BLACK, WHITE, (is_frame || is_active_bit) && !is_margin);
                         return vec4f(vec3f(color),1);
                     }
                 `
@@ -237,21 +242,11 @@
             }
 
             function resize() {
-                const width = window.innerWidth * devicePixelRatio;
-                const height = window.innerHeight * devicePixelRatio;
-                const dimBig = Math.max(width,height);
-                const dimSmall = Math.min(width,height);
-                if (screen.orientation.type.startsWith('portrait')) {
-                    canvas.width = dimSmall;
-                    canvas.height = dimBig;
-                }
-                else {
-                    canvas.width = dimBig;
-                    canvas.height = dimSmall;
-                }
+                canvas.width = window.innerWidth * devicePixelRatio;
+                canvas.height = window.innerHeight * devicePixelRatio;
                 aspectRatio = canvas.height/canvas.width;
-                dim = Math.min(1,aspectRatio)*0.65;
-                origin = [0.02,0.02];
+                dim = Math.min(1,aspectRatio)*0.96;
+                origin = [0.02,0.02*aspectRatio];
                 UNIFORM_BUFFER.set([aspectRatio], AR_IDX);
                 UNIFORM_BUFFER.set([dim],DIM_IDX);
                 UNIFORM_BUFFER.set(origin,ORIGIN_IDX);
